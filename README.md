@@ -44,7 +44,7 @@
 ## Installation
 
 ```bash
-git clone https://github.com/redblue-frank/adpulse.git
+git clone https://github.com/BloodBlinker/ADPulse.git
 cd adpulse
 chmod +x adpulse.sh
 ```
@@ -147,4 +147,4 @@ This tool is intended **exclusively** for authorized security testing and educat
 
 ## Author
 
-**RedBlue_Frank** — [GitHub](https://github.com/redblue-frank)
+**Robin Roy** — [GitHub](https://github.com/BloodBlinker)
